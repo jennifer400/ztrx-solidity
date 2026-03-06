@@ -4,7 +4,10 @@ pragma solidity ^0.8.24;
 library Errors {
     error Unauthorized();
     error InvalidMarket();
+    error InvalidSignature();
+    error QuoteAlreadyUsed();
     error InsufficientMargin();
+    error InsufficientBalance();
     error InvalidLeverage();
     error InvalidCoverageRatio();
     error InactivePosition();
@@ -12,5 +15,10 @@ library Errors {
     error InsuranceNotActive();
     error QuoteExpired();
     error VaultCapacityExceeded();
+    error InvalidAddress();
     error ZeroAmount();
+    error InvalidOracleConfig();
+    error StalePrice();
+    error InvalidPrice();
+    error PriceDeviationTooHigh();
 }

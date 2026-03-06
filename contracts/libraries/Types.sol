@@ -27,9 +27,10 @@ library Types {
         uint256 leverageX18;
         bool isLong;
         PositionStatus status;
+        InsuranceStatus insuranceStatus;
         uint64 openedAt;
         uint64 closedAt;
-        uint256 insuranceId;
+        bytes32 insuranceTermId;
     }
 
     struct InsuranceTerms {

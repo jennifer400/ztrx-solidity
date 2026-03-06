@@ -3,7 +3,20 @@ pragma solidity ^0.8.24;
 
 library Events {
     event Deposited(address indexed account, address indexed token, uint256 amount);
+    event Deposited(address indexed account, uint256 amount);
     event Withdrawn(address indexed account, address indexed token, uint256 amount);
+    event Withdrawn(address indexed account, uint256 amount);
+    event PriceUpdated(address indexed asset, uint256 priceX18, uint256 updatedAt);
+    event OracleMarketConfigured(
+        bytes32 indexed marketId,
+        address indexed markFeed,
+        address indexed indexFeed,
+        uint32 maxStaleness,
+        uint16 maxDeviationBps,
+        uint256 minPriceX18,
+        uint256 maxPriceX18
+    );
+    event LossCovered(uint256 requested, uint256 covered);
 
     event PositionOpened(
         uint256 indexed positionId,
@@ -40,6 +53,7 @@ library Events {
         address token,
         uint256 claimAmount
     );
+    event InsuranceCancelled(uint256 indexed insuranceId, uint256 indexed positionId);
 
     event LiquidationTriggered(uint256 indexed positionId, address indexed liquidator, uint256 markPriceX18);
     event LiquidationCompleted(
@@ -50,8 +64,15 @@ library Events {
     );
 
     event VaultFunded(address indexed funder, address indexed token, uint256 amount, uint256 totalAssets);
+    event VaultPremiumReceived(address indexed payer, address indexed token, uint256 amount, uint256 totalAssets);
     event VaultReserved(uint256 indexed insuranceId, uint256 amount, uint256 totalReserved);
     event VaultReserveReleased(uint256 indexed insuranceId, uint256 amount, uint256 totalReserved);
+    event VaultClaimPaid(
+        uint256 indexed positionId, address indexed recipient, address indexed token, uint256 amount, uint256 totalAssets
+    );
+    event MarginLocked(address indexed account, uint256 amount, uint256 newLockedMargin);
+    event MarginUnlocked(address indexed account, uint256 amount, uint256 newLockedMargin);
+    event SettlementTransferred(address indexed to, address indexed token, uint256 amount);
 
     event MarketConfigUpdated(
         bytes32 indexed marketId,
