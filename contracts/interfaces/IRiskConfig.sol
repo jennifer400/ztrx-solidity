@@ -6,8 +6,15 @@ import {Types} from "../libraries/Types.sol";
 interface IRiskConfig {
     function getMarketConfig(bytes32 marketId) external view returns (Types.MarketConfig memory config);
     function maxCoverageRatioBps() external view returns (uint256);
+    function maxCoverageRatioByTier(uint8 tier) external view returns (uint256);
+    function maxInsurableAmountByMarket(bytes32 marketId) external view returns (uint256);
+    function minHoldingTimeByMarket(bytes32 marketId) external view returns (uint256);
+    function activationDelayByMarket(bytes32 marketId) external view returns (uint256);
+    function fullActivationDelayByMarket(bytes32 marketId) external view returns (uint256);
+    function cooldownSecondsByTier(uint8 tier) external view returns (uint256);
     function premiumTreasuryBps() external view returns (uint256);
     function vaultUtilizationLimitBps() external view returns (uint256);
+    function utilizationThrottleBps() external view returns (uint256);
     function liquidationPenaltyBps() external view returns (uint256);
     function quoteSigner() external view returns (address);
 }

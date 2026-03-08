@@ -24,7 +24,7 @@ contract ProtocolFuzzTest {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
     bytes32 private constant QUOTE_TYPEHASH = keccak256(
-        "InsuranceQuote(address user,bytes32 marketId,bool side,uint256 leverageX18,uint256 sizeUsdX18,uint256 premiumBps,uint256 coverageRatioBps,uint256 expiry,uint256 nonce,bytes32 modelVersion)"
+        "InsuranceQuote(address user,bytes32 marketId,bool side,uint256 leverageX18,uint256 sizeUsdX18,uint256 premiumBps,uint256 coverageRatioBps,bytes32 riskControlsHash,uint256 expiry,uint256 nonce,bytes32 modelVersion)"
     );
     bytes32 private constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
@@ -214,6 +214,13 @@ contract ProtocolFuzzTest {
             sizeUsdX18: sizeUsd,
             premiumBps: premiumBps,
             coverageRatioBps: coverageBps,
+            maxInsurableAmount: sizeUsd * 2,
+            minHoldingTime: 0,
+            cooldownSeconds: 0,
+            activationDelay: 0,
+            fullActivationDelay: 0,
+            userTier: 1,
+            marketTier: 1,
             expiry: expiry,
             nonce: nonce,
             modelVersion: keccak256("model-v1")
@@ -222,6 +229,17 @@ contract ProtocolFuzzTest {
     }
 
     function _signQuote(IInsuranceController.SignedInsuranceQuote memory q) internal returns (bytes memory sig) {
+        bytes32 riskControlsHash = keccak256(
+            abi.encode(
+                q.maxInsurableAmount,
+                q.minHoldingTime,
+                q.cooldownSeconds,
+                q.activationDelay,
+                q.fullActivationDelay,
+                q.userTier,
+                q.marketTier
+            )
+        );
         bytes32 structHash = keccak256(
             abi.encode(
                 QUOTE_TYPEHASH,
@@ -232,6 +250,7 @@ contract ProtocolFuzzTest {
                 q.sizeUsdX18,
                 q.premiumBps,
                 q.coverageRatioBps,
+                riskControlsHash,
                 q.expiry,
                 q.nonce,
                 q.modelVersion

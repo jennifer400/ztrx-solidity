@@ -1,18 +1,245 @@
-# ztrx solidity
+# ZTRX Solidity Core
 
-Foundry project scaffold for a modular perpetual/risk system.
+An on-chain core for a decentralized perpetual exchange with protocol-native lifecycle insurance.
 
-## Structure
+This repository focuses on settlement, risk enforcement, liquidation, insurance capacity management, and fee routing.  
+It does **not** implement a full on-chain matching engine.
 
-- contracts/interfaces
-- contracts/libraries
-- contracts/core
-- test
-- script
+---
 
-## Quick start
+## 1) Project Positioning
+
+ZTRX uses a **hybrid design**:
+
+- **Off-chain**: pricing/risk engine computes insurance quotes.
+- **On-chain**: contracts verify signatures, enforce constraints, execute state transitions, and settle funds.
+
+This keeps pricing flexible while keeping critical enforcement auditable and deterministic on-chain.
+
+---
+
+## 2) Tech Stack
+
+- Solidity `^0.8.24`
+- Foundry
+- OpenZeppelin `Ownable2Step` (MVP access model)
+
+Design constraints used in this codebase:
+
+- No upgradeable proxy in MVP
+- Explicit constructor wiring for dependencies
+- Basis points (`bps`) for ratios (`10000 = 100%`)
+- Custom errors instead of revert strings
+- CEI pattern around external token interactions
+
+---
+
+## 3) Repository Structure
+
+```text
+contracts/
+  core/         # business modules
+  interfaces/   # narrow cross-module interfaces
+  libraries/    # shared types/errors/events/math
+test/           # unit + fuzz + invariant tests
+script/
+```
+
+---
+
+## 4) Core Modules
+
+### MarginVault
+
+- Custodies user collateral (single collateral token in MVP)
+- Tracks `totalBalance`, `lockedMargin`, `availableBalance`
+- Authorizes protocol modules to lock/unlock margin
+
+### PositionManager
+
+- Authoritative position lifecycle state
+- One active position per user per market (MVP)
+- Open/increase/reduce/close/markLiquidated
+
+### RiskConfig
+
+Governance-controlled config source for:
+
+- Market risk parameters
+- Global insurance constraints
+- Tier- and market-based insurance limits
+- Quote signer
+
+### OracleAdapter
+
+- Normalized mark/index prices (`x18`)
+- Staleness checks
+- Deviation bounds
+- Configurable feeds per market
+
+### RiskVault
+
+- Insurance reserve pool
+- Tracks `totalAssets`, `totalReserved`, `reservedByPosition`
+- Reserve/release capacity and pay claims
+
+### InsuranceController
+
+- Verifies EIP-712 signed quotes
+- Prevents quote replay
+- Activates coverage and reserves vault capacity
+- Settles premium on profit (no upfront premium)
+- Processes liquidation claims with staged activation controls
+
+### LiquidationEngine
+
+- Evaluates maintenance margin breach
+- Executes liquidation path
+- Triggers insurance claim flow when eligible
+
+### FeeRouter
+
+- Routes premium/protocol fees between treasury and RiskVault
+- Uses configured split from RiskConfig
+- Keeps accounting explicit and queryable
+
+---
+
+## 5) Dependency Graph (Concise)
+
+- `PositionManager -> IMarginVault, IRiskConfig, IInsuranceController`
+- `LiquidationEngine -> IPositionManager, IOracleAdapter, IRiskConfig, IInsuranceController`
+- `InsuranceController -> IRiskConfig, IRiskVault`
+- `RiskVault -> IRiskConfig`
+- `FeeRouter -> IRiskConfig, IRiskVault`
+
+---
+
+## 6) Key Mechanisms
+
+### 6.1 Off-chain pricing, on-chain enforcement
+
+The quote carries pricing/risk outputs (`premiumBps`, `coverageRatioBps`, controls), while chain enforces:
+
+- signature validity
+- expiry and nonce replay protection
+- max coverage constraints
+- max insurable amount
+- vault utilization throttle
+- cooldown/min-holding/staged-activation restrictions
+
+### 6.2 Premium is not charged upfront
+
+- At coverage registration: only snapshot + reserve capacity.
+- Premium is charged later in `settlePremiumOnProfit(...)` only if realized profit > 0.
+
+### 6.3 Staged claim effectiveness
+
+Coverage can scale in over time:
+
+- before `activationDelay`: zero effective coverage
+- between `activationDelay` and `fullActivationDelay`: linearly increasing
+- after `fullActivationDelay`: full quoted coverage
+
+---
+
+## 7) Deployment and Wiring
+
+Recommended deployment order:
+
+1. `RiskConfig`
+2. `MarginVault`
+3. `RiskVault`
+4. `OracleAdapter`
+5. `InsuranceController`
+6. `PositionManager`
+7. `LiquidationEngine`
+8. `FeeRouter`
+
+Recommended initialization wiring:
+
+- `MarginVault.setAuthorizedModule(PositionManager, true)`
+- `PositionManager.setRelayer(relayer, true)`
+- `PositionManager.setInsuranceController(InsuranceController)`
+- `RiskVault.setInsuranceController(InsuranceController)`
+- `RiskVault.setPremiumCaller(InsuranceController, true)`
+- `RiskVault.setPremiumCaller(FeeRouter, true)` (if used)
+- `InsuranceController.setAuthorizedCaller(orchestrator / engine, true)`
+- `FeeRouter.setAuthorizedCaller(protocol module, true)`
+
+---
+
+## 8) Text-Based Sequence Diagrams
+
+### 8.1 Open Position + Activate Insurance
+
+1. `User -> MarginVault`: `deposit(amount)`
+2. `Relayer -> PositionManager`: `openPosition(params)`
+3. `PositionManager -> MarginVault`: `lockMargin(user, margin)`
+4. `Orchestrator -> InsuranceController`: `registerCoverage(positionId, signedQuote, signature)`
+5. `InsuranceController`: verify signature, expiry, replay, caps, utilization throttle
+6. `InsuranceController -> RiskVault`: `reserveCapacity(positionId, reserveAmount)`
+7. `InsuranceController`: store coverage snapshot (active)
+
+### 8.2 Profitable Close + Premium Settlement
+
+1. `Relayer -> PositionManager`: `closePosition(...)`
+2. `PositionManager -> MarginVault`: `unlockMargin(user, ...)`
+3. `Orchestrator -> InsuranceController`: `settlePremiumOnProfit(positionId, user, realizedProfit)`
+4. `InsuranceController`: compute `premium = realizedProfit * premiumBps / 10000`
+5. `InsuranceController -> Token`: `transferFrom(user, InsuranceController, premium)`
+6. `InsuranceController -> RiskVault`: `receivePremium(premium)`
+7. `InsuranceController`: mark premium settled
+
+### 8.3 Liquidation + Insurance Claim
+
+1. `Keeper -> LiquidationEngine`: `liquidate(user, marketId)`
+2. `LiquidationEngine -> OracleAdapter`: read mark price (freshness/deviation checked)
+3. `LiquidationEngine`: check maintenance margin breach
+4. `LiquidationEngine -> InsuranceController`: `processLiquidationClaim(positionId, user, realizedLoss, eligible=true)` (if active)
+5. `InsuranceController`: enforce min holding, staged activation, cooldown policy
+6. `InsuranceController -> RiskVault`: `payClaim(positionId, user, claimAmount)`
+7. `LiquidationEngine -> PositionManager`: `markLiquidated(...)`
+8. `PositionManager -> MarginVault`: unlock/finalize margin state
+
+---
+
+## 9) Run and Test
+
+Build:
 
 ```bash
 forge build
+```
+
+Run all tests:
+
+```bash
 forge test
 ```
+
+Target specific suites:
+
+```bash
+forge test --match-contract PositionManagerTest
+forge test --match-contract InsuranceControllerTest
+forge test --match-contract ProtocolFuzzTest
+forge test --match-contract ProtocolInvariants
+```
+
+---
+
+## 10) Current Test Coverage
+
+- Unit tests: access control, state transitions, event assertions, boundary reverts
+- Fuzz tests: leverage bounds, premium settlement, claim cap behavior, reserve/release accounting, replay/expiry
+- Invariants: margin lock safety, reserve utilization safety, no quote replay success, no double-claim success, no upfront premium charge
+
+---
+
+## 11) Notes and MVP Boundaries
+
+- Single collateral token in current MVP
+- Relayer/oracle/signing inputs are trusted infrastructure assumptions
+- No on-chain matching engine in this repo
+- `bps` is used for all ratios (`10000 = 100%`)

@@ -20,14 +20,31 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
     uint256 private _maxCoverageRatioBps;
     uint256 private _premiumTreasuryBps;
     uint256 private _vaultUtilizationLimitBps;
+    uint256 private _utilizationThrottleBps;
     uint256 private _liquidationPenaltyBps;
     address private _quoteSigner;
+    mapping(uint8 tier => uint256) private _maxCoverageRatioByTier;
+    mapping(bytes32 marketId => uint256) private _maxInsurableAmountByMarket;
+    mapping(bytes32 marketId => uint256) private _minHoldingTimeByMarket;
+    mapping(bytes32 marketId => uint256) private _activationDelayByMarket;
+    mapping(bytes32 marketId => uint256) private _fullActivationDelayByMarket;
+    mapping(uint8 tier => uint256) private _cooldownSecondsByTier;
 
     event MaxCoverageRatioUpdated(uint256 previousValue, uint256 newValue);
     event PremiumTreasuryBpsUpdated(uint256 previousValue, uint256 newValue);
     event VaultUtilizationLimitBpsUpdated(uint256 previousValue, uint256 newValue);
+    event UtilizationThrottleBpsUpdated(uint256 previousValue, uint256 newValue);
     event LiquidationPenaltyBpsUpdated(uint256 previousValue, uint256 newValue);
     event QuoteSignerUpdated(address indexed previousSigner, address indexed newSigner);
+    event CoverageTierUpdated(uint8 indexed tier, uint256 maxCoverageRatioBps);
+    event MarketInsuranceLimitsUpdated(
+        bytes32 indexed marketId,
+        uint256 maxInsurableAmount,
+        uint256 minHoldingTime,
+        uint256 activationDelay,
+        uint256 fullActivationDelay
+    );
+    event TierCooldownUpdated(uint8 indexed tier, uint256 cooldownSeconds);
 
     /// @notice Deploys the RiskConfig with an initial owner and global risk parameters.
     /// @param initialOwner The governance owner with permission to update risk parameters.
@@ -48,6 +65,7 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         _setMaxCoverageRatioBps(initialMaxCoverageRatioBps);
         _setPremiumTreasuryBps(initialPremiumTreasuryBps);
         _setVaultUtilizationLimitBps(initialVaultUtilizationLimitBps);
+        _setUtilizationThrottleBps(initialVaultUtilizationLimitBps);
         _setLiquidationPenaltyBps(initialLiquidationPenaltyBps);
     }
 
@@ -95,6 +113,12 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         _setVaultUtilizationLimitBps(newVaultUtilizationLimitBps);
     }
 
+    /// @notice Updates dynamic insurance utilization throttle.
+    /// @param newUtilizationThrottleBps Throttle in basis points.
+    function setUtilizationThrottleBps(uint256 newUtilizationThrottleBps) external onlyOwner {
+        _setUtilizationThrottleBps(newUtilizationThrottleBps);
+    }
+
     /// @notice Updates global liquidation penalty ratio.
     /// @param newLiquidationPenaltyBps Penalty ratio in basis points.
     function setLiquidationPenaltyBps(uint256 newLiquidationPenaltyBps) external onlyOwner {
@@ -105,6 +129,48 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
     /// @param newQuoteSigner New signer address.
     function setQuoteSigner(address newQuoteSigner) external onlyOwner {
         _setQuoteSigner(newQuoteSigner);
+    }
+
+    /// @notice Sets coverage cap by user tier.
+    /// @param tier Tier identifier.
+    /// @param maxCoverageRatioBps_ Max coverage ratio for this tier.
+    function setCoverageTier(uint8 tier, uint256 maxCoverageRatioBps_) external onlyOwner {
+        if (maxCoverageRatioBps_ > MAX_COVERAGE_RATIO_BPS) revert Errors.InvalidCoverageRatio();
+        _maxCoverageRatioByTier[tier] = maxCoverageRatioBps_;
+        emit CoverageTierUpdated(tier, maxCoverageRatioBps_);
+    }
+
+    /// @notice Sets market-specific insurance limits.
+    /// @param marketId Market identifier.
+    /// @param maxInsurableAmount Max insurable notional amount.
+    /// @param minHoldingTime Min holding seconds before claim eligibility.
+    /// @param activationDelay Delay before insurance starts scaling in.
+    /// @param fullActivationDelay Delay when full coverage is reached.
+    function setMarketInsuranceLimits(
+        bytes32 marketId,
+        uint256 maxInsurableAmount,
+        uint256 minHoldingTime,
+        uint256 activationDelay,
+        uint256 fullActivationDelay
+    ) external onlyOwner {
+        if (marketId == bytes32(0) || maxInsurableAmount == 0) revert Errors.InvalidMarket();
+        if (fullActivationDelay < activationDelay) revert InvalidBps();
+
+        _maxInsurableAmountByMarket[marketId] = maxInsurableAmount;
+        _minHoldingTimeByMarket[marketId] = minHoldingTime;
+        _activationDelayByMarket[marketId] = activationDelay;
+        _fullActivationDelayByMarket[marketId] = fullActivationDelay;
+        emit MarketInsuranceLimitsUpdated(
+            marketId, maxInsurableAmount, minHoldingTime, activationDelay, fullActivationDelay
+        );
+    }
+
+    /// @notice Sets claim cooldown by tier.
+    /// @param tier Tier identifier.
+    /// @param cooldownSeconds Cooldown duration in seconds.
+    function setTierCooldown(uint8 tier, uint256 cooldownSeconds) external onlyOwner {
+        _cooldownSecondsByTier[tier] = cooldownSeconds;
+        emit TierCooldownUpdated(tier, cooldownSeconds);
     }
 
     /// @notice Returns market risk configuration.
@@ -150,6 +216,11 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         return _vaultUtilizationLimitBps;
     }
 
+    /// @notice Returns dynamic utilization throttle for accepting new coverage.
+    function utilizationThrottleBps() external view override returns (uint256) {
+        return _utilizationThrottleBps;
+    }
+
     /// @notice Returns the global liquidation penalty (in bps).
     function liquidationPenaltyBps() external view override returns (uint256) {
         return _liquidationPenaltyBps;
@@ -158,6 +229,37 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
     /// @notice Returns the authorized off-chain quote signer.
     function quoteSigner() external view override returns (address) {
         return _quoteSigner;
+    }
+
+    /// @notice Returns max coverage ratio for a tier. Falls back to global cap when not set.
+    function maxCoverageRatioByTier(uint8 tier) external view override returns (uint256) {
+        uint256 tierCap = _maxCoverageRatioByTier[tier];
+        return tierCap == 0 ? _maxCoverageRatioBps : tierCap;
+    }
+
+    /// @notice Returns market max insurable amount.
+    function maxInsurableAmountByMarket(bytes32 marketId) external view override returns (uint256) {
+        return _maxInsurableAmountByMarket[marketId];
+    }
+
+    /// @notice Returns minimum holding time required for claims in a market.
+    function minHoldingTimeByMarket(bytes32 marketId) external view override returns (uint256) {
+        return _minHoldingTimeByMarket[marketId];
+    }
+
+    /// @notice Returns activation delay for staged coverage in a market.
+    function activationDelayByMarket(bytes32 marketId) external view override returns (uint256) {
+        return _activationDelayByMarket[marketId];
+    }
+
+    /// @notice Returns full activation delay for staged coverage in a market.
+    function fullActivationDelayByMarket(bytes32 marketId) external view override returns (uint256) {
+        return _fullActivationDelayByMarket[marketId];
+    }
+
+    /// @notice Returns claim cooldown duration for a tier.
+    function cooldownSecondsByTier(uint8 tier) external view override returns (uint256) {
+        return _cooldownSecondsByTier[tier];
     }
 
     function _setMaxCoverageRatioBps(uint256 newValue) internal {
@@ -186,6 +288,13 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         uint256 previous = _liquidationPenaltyBps;
         _liquidationPenaltyBps = newValue;
         emit LiquidationPenaltyBpsUpdated(previous, newValue);
+    }
+
+    function _setUtilizationThrottleBps(uint256 newValue) internal {
+        if (newValue == 0 || newValue > BPS_DIVISOR) revert InvalidBps();
+        uint256 previous = _utilizationThrottleBps;
+        _utilizationThrottleBps = newValue;
+        emit UtilizationThrottleBpsUpdated(previous, newValue);
     }
 
     function _setQuoteSigner(address newSigner) internal {

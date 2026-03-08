@@ -21,4 +21,8 @@ library Errors {
     error StalePrice();
     error InvalidPrice();
     error PriceDeviationTooHigh();
+    error CooldownActive();
+    error MinHoldingNotMet();
+    error CoverageNotEffective();
+    error ExceedsMaxInsurableAmount();
 }

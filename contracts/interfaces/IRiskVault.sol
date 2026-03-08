@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 interface IRiskVault {
+    function totalAssets() external view returns (uint256);
+    function totalReserved() external view returns (uint256);
     /// @notice Adds collateral assets to the vault.
     function fundVault(uint256 amount) external;
     /// @notice Reserves claim capacity for a position.

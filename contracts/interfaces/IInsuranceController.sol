@@ -10,6 +10,13 @@ interface IInsuranceController {
         uint256 sizeUsdX18;
         uint256 premiumBps;
         uint256 coverageRatioBps;
+        uint256 maxInsurableAmount;
+        uint256 minHoldingTime;
+        uint256 cooldownSeconds;
+        uint256 activationDelay;
+        uint256 fullActivationDelay;
+        uint8 userTier;
+        uint8 marketTier;
         uint256 expiry;
         uint256 nonce;
         bytes32 modelVersion;

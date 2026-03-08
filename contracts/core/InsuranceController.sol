@@ -22,7 +22,7 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     error TransferFailed();
 
     bytes32 internal constant QUOTE_TYPEHASH = keccak256(
-        "InsuranceQuote(address user,bytes32 marketId,bool side,uint256 leverageX18,uint256 sizeUsdX18,uint256 premiumBps,uint256 coverageRatioBps,uint256 expiry,uint256 nonce,bytes32 modelVersion)"
+        "InsuranceQuote(address user,bytes32 marketId,bool side,uint256 leverageX18,uint256 sizeUsdX18,uint256 premiumBps,uint256 coverageRatioBps,bytes32 riskControlsHash,uint256 expiry,uint256 nonce,bytes32 modelVersion)"
     );
     bytes32 internal constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
@@ -36,7 +36,15 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
         uint256 sizeUsdX18;
         uint256 premiumBps;
         uint256 coverageRatioBps;
+        uint256 maxInsurableAmount;
+        uint256 minHoldingTime;
+        uint256 cooldownSeconds;
+        uint256 activationDelay;
+        uint256 fullActivationDelay;
+        uint8 userTier;
+        uint8 marketTier;
         uint256 reservedAmount;
+        uint256 activatedAt;
         uint256 quoteExpiry;
         uint256 quoteNonce;
         bytes32 modelVersion;
@@ -52,6 +60,7 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     mapping(address caller => bool isAuthorized) public authorizedCaller;
     mapping(uint256 positionId => CoverageSnapshot coverage) private _coverageByPosition;
     mapping(bytes32 quoteHash => bool used) public usedQuotes;
+    mapping(address user => uint256 untilTimestamp) public userCooldownUntil;
 
     event AuthorizedCallerUpdated(address indexed caller, bool isAuthorized);
 
@@ -96,37 +105,55 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     {
         if (positionId == 0) revert Errors.InactivePosition();
         if (quote.expiry < block.timestamp) revert Errors.QuoteExpired();
+        if (block.timestamp < userCooldownUntil[quote.user]) revert Errors.CooldownActive();
 
         bytes32 quoteHash = _quoteHash(quote);
         if (usedQuotes[quoteHash]) revert Errors.QuoteAlreadyUsed();
         if (!verifyQuote(quote, signature)) revert Errors.InvalidSignature();
 
-        uint256 cap = IRiskConfig(riskConfig).maxCoverageRatioBps();
-        if (quote.coverageRatioBps > cap) revert Errors.InvalidCoverageRatio();
+        uint256 cap = _coverageCap(quote.userTier);
+        if (quote.coverageRatioBps == 0 || quote.coverageRatioBps > cap) revert Errors.InvalidCoverageRatio();
+
+        uint256 maxInsurable = _resolveMaxInsurable(quote);
+        if (maxInsurable == 0 || quote.sizeUsdX18 > maxInsurable) revert Errors.ExceedsMaxInsurableAmount();
+
+        uint256 minHoldingTime = _resolveMinHoldingTime(quote);
+        uint256 activationDelay = _resolveActivationDelay(quote);
+        uint256 fullActivationDelay = _resolveFullActivationDelay(quote);
+        uint256 cooldownSeconds = _resolveCooldownSeconds(quote);
+        if (fullActivationDelay < activationDelay) revert Errors.InvalidLiquidationState();
 
         uint256 reserveAmount = MathLib.mulBps(quote.sizeUsdX18, quote.coverageRatioBps);
+        _checkUtilizationThrottle(reserveAmount);
         usedQuotes[quoteHash] = true;
 
-        _coverageByPosition[positionId] = CoverageSnapshot({
-            user: quote.user,
-            marketId: quote.marketId,
-            side: quote.side,
-            leverageX18: quote.leverageX18,
-            sizeUsdX18: quote.sizeUsdX18,
-            premiumBps: quote.premiumBps,
-            coverageRatioBps: quote.coverageRatioBps,
-            reservedAmount: reserveAmount,
-            quoteExpiry: quote.expiry,
-            quoteNonce: quote.nonce,
-            modelVersion: quote.modelVersion,
-            quoteHash: quoteHash,
-            status: Types.InsuranceStatus.Active,
-            premiumSettled: false
-        });
+        CoverageSnapshot storage snapshot = _coverageByPosition[positionId];
+        snapshot.user = quote.user;
+        snapshot.marketId = quote.marketId;
+        snapshot.side = quote.side;
+        snapshot.leverageX18 = quote.leverageX18;
+        snapshot.sizeUsdX18 = quote.sizeUsdX18;
+        snapshot.premiumBps = quote.premiumBps;
+        snapshot.coverageRatioBps = quote.coverageRatioBps;
+        snapshot.maxInsurableAmount = maxInsurable;
+        snapshot.minHoldingTime = minHoldingTime;
+        snapshot.cooldownSeconds = cooldownSeconds;
+        snapshot.activationDelay = activationDelay;
+        snapshot.fullActivationDelay = fullActivationDelay;
+        snapshot.userTier = quote.userTier;
+        snapshot.marketTier = quote.marketTier;
+        snapshot.reservedAmount = reserveAmount;
+        snapshot.activatedAt = block.timestamp;
+        snapshot.quoteExpiry = quote.expiry;
+        snapshot.quoteNonce = quote.nonce;
+        snapshot.modelVersion = quote.modelVersion;
+        snapshot.quoteHash = quoteHash;
+        snapshot.status = Types.InsuranceStatus.Active;
+        snapshot.premiumSettled = false;
 
         IRiskVault(riskVault).reserveCapacity(positionId, reserveAmount);
         emit Events.InsuranceActivated(
-            positionId, positionId, quoteHash, quote.coverageRatioBps, quote.premiumBps, reserveAmount
+            positionId, positionId, quoteHash, snapshot.coverageRatioBps, snapshot.premiumBps, reserveAmount
         );
     }
 
@@ -178,11 +205,17 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
         if (snapshot.status != Types.InsuranceStatus.Active) revert Errors.InsuranceNotActive();
         if (!eligible || recipient == address(0)) revert Errors.InvalidLiquidationState();
         if (realizedLoss == 0) revert Errors.InvalidLiquidationState();
+        if (block.timestamp < snapshot.activatedAt + snapshot.minHoldingTime) revert Errors.MinHoldingNotMet();
 
-        uint256 maxClaim = MathLib.mulBps(realizedLoss, snapshot.coverageRatioBps);
+        uint256 effectiveCoverageBps = _effectiveCoverageBps(snapshot);
+        if (effectiveCoverageBps == 0) revert Errors.CoverageNotEffective();
+        uint256 maxClaim = MathLib.mulBps(realizedLoss, effectiveCoverageBps);
         claimPaid = maxClaim < snapshot.reservedAmount ? maxClaim : snapshot.reservedAmount;
 
         snapshot.status = Types.InsuranceStatus.Settled;
+        if (snapshot.cooldownSeconds > 0) {
+            userCooldownUntil[snapshot.user] = block.timestamp + snapshot.cooldownSeconds;
+        }
         IRiskVault(riskVault).payClaim(positionId, recipient, claimPaid);
 
         emit Events.ClaimPaid(positionId, positionId, recipient, collateralToken, claimPaid);
@@ -255,6 +288,7 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     }
 
     function _quoteHash(SignedInsuranceQuote calldata quote) internal pure returns (bytes32) {
+        bytes32 riskControlsHash = _riskControlsHash(quote);
         return keccak256(
             abi.encode(
                 QUOTE_TYPEHASH,
@@ -265,6 +299,7 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
                 quote.sizeUsdX18,
                 quote.premiumBps,
                 quote.coverageRatioBps,
+                riskControlsHash,
                 quote.expiry,
                 quote.nonce,
                 quote.modelVersion
@@ -303,5 +338,70 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     function _safeApprove(address token, address spender, uint256 amount) internal {
         (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Minimal.approve.selector, spender, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
+    }
+
+    function _effectiveCoverageBps(CoverageSnapshot memory snapshot) internal view returns (uint256) {
+        uint256 elapsed = block.timestamp > snapshot.activatedAt ? block.timestamp - snapshot.activatedAt : 0;
+        if (elapsed < snapshot.activationDelay) return 0;
+        if (snapshot.fullActivationDelay <= snapshot.activationDelay) return snapshot.coverageRatioBps;
+        if (elapsed >= snapshot.fullActivationDelay) return snapshot.coverageRatioBps;
+
+        uint256 activeWindow = snapshot.fullActivationDelay - snapshot.activationDelay;
+        uint256 progress = elapsed - snapshot.activationDelay;
+        return (snapshot.coverageRatioBps * progress) / activeWindow;
+    }
+
+    function _checkUtilizationThrottle(uint256 reserveAmount) internal view {
+        uint256 throttleBps = IRiskConfig(riskConfig).utilizationThrottleBps();
+        if (throttleBps == 0) return;
+        uint256 assets = IRiskVault(riskVault).totalAssets();
+        uint256 reserved = IRiskVault(riskVault).totalReserved();
+        uint256 maxReserved = MathLib.mulBps(assets, throttleBps);
+        if (reserved + reserveAmount > maxReserved) revert Errors.VaultCapacityExceeded();
+    }
+
+    function _riskControlsHash(SignedInsuranceQuote calldata quote) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                quote.maxInsurableAmount,
+                quote.minHoldingTime,
+                quote.cooldownSeconds,
+                quote.activationDelay,
+                quote.fullActivationDelay,
+                quote.userTier,
+                quote.marketTier
+            )
+        );
+    }
+
+    function _coverageCap(uint8 userTier) internal view returns (uint256) {
+        uint256 globalCap = IRiskConfig(riskConfig).maxCoverageRatioBps();
+        uint256 tierCap = IRiskConfig(riskConfig).maxCoverageRatioByTier(userTier);
+        return globalCap < tierCap ? globalCap : tierCap;
+    }
+
+    function _resolveMaxInsurable(SignedInsuranceQuote calldata quote) internal view returns (uint256) {
+        uint256 marketMaxInsurable = IRiskConfig(riskConfig).maxInsurableAmountByMarket(quote.marketId);
+        return marketMaxInsurable == 0 ? quote.maxInsurableAmount : marketMaxInsurable;
+    }
+
+    function _resolveMinHoldingTime(SignedInsuranceQuote calldata quote) internal view returns (uint256) {
+        uint256 v = IRiskConfig(riskConfig).minHoldingTimeByMarket(quote.marketId);
+        return v == 0 ? quote.minHoldingTime : v;
+    }
+
+    function _resolveActivationDelay(SignedInsuranceQuote calldata quote) internal view returns (uint256) {
+        uint256 v = IRiskConfig(riskConfig).activationDelayByMarket(quote.marketId);
+        return v == 0 ? quote.activationDelay : v;
+    }
+
+    function _resolveFullActivationDelay(SignedInsuranceQuote calldata quote) internal view returns (uint256) {
+        uint256 v = IRiskConfig(riskConfig).fullActivationDelayByMarket(quote.marketId);
+        return v == 0 ? quote.fullActivationDelay : v;
+    }
+
+    function _resolveCooldownSeconds(SignedInsuranceQuote calldata quote) internal view returns (uint256) {
+        uint256 v = IRiskConfig(riskConfig).cooldownSecondsByTier(quote.userTier);
+        return v == 0 ? quote.cooldownSeconds : v;
     }
 }
