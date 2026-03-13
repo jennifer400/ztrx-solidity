@@ -65,6 +65,31 @@ library Events {
 
     event VaultFunded(address indexed funder, address indexed token, uint256 amount, uint256 totalAssets);
     event VaultPremiumReceived(address indexed payer, address indexed token, uint256 amount, uint256 totalAssets);
+    event VaultLiquidityDeposited(
+        address indexed provider,
+        address indexed token,
+        uint256 assetAmount,
+        uint256 shareAmount,
+        uint256 totalAssets,
+        uint256 totalShares
+    );
+    event VaultLiquidityWithdrawn(
+        address indexed provider,
+        address indexed token,
+        uint256 assetAmount,
+        uint256 shareAmount,
+        uint256 totalAssets,
+        uint256 totalShares
+    );
+    event VaultYieldClaimed(
+        address indexed provider,
+        address indexed token,
+        uint256 assetAmount,
+        uint256 shareAmount,
+        uint256 remainingPrincipal,
+        uint256 totalAssets,
+        uint256 totalShares
+    );
     event VaultReserved(uint256 indexed insuranceId, uint256 amount, uint256 totalReserved);
     event VaultReserveReleased(uint256 indexed insuranceId, uint256 amount, uint256 totalReserved);
     event VaultClaimPaid(

@@ -8,6 +8,7 @@ import {MathLib} from "../libraries/MathLib.sol";
 import {IFeeRouter} from "../interfaces/IFeeRouter.sol";
 import {IRiskConfig} from "../interfaces/IRiskConfig.sol";
 import {IRiskVault} from "../interfaces/IRiskVault.sol";
+import {IZTRXNFTBenefits} from "../interfaces/IZTRXNFTBenefits.sol";
 
 interface IERC20Minimal {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -27,6 +28,7 @@ contract FeeRouter is Ownable2Step, IFeeRouter {
     address public immutable riskVault;
     address public immutable riskConfig;
     address public treasury;
+    address public benefitNFT;
 
     mapping(address caller => bool isAuthorized) public authorizedCaller;
 
@@ -37,6 +39,7 @@ contract FeeRouter is Ownable2Step, IFeeRouter {
 
     event TreasuryUpdated(address indexed previousTreasury, address indexed newTreasury);
     event AuthorizedCallerUpdated(address indexed caller, bool isAuthorized);
+    event BenefitNFTUpdated(address indexed previousBenefitNFT, address indexed newBenefitNFT);
     event PremiumRouted(
         address indexed caller,
         address indexed payer,
@@ -96,6 +99,12 @@ contract FeeRouter is Ownable2Step, IFeeRouter {
         emit TreasuryUpdated(previous, newTreasury);
     }
 
+    function setBenefitNFT(address newBenefitNFT) external onlyOwner {
+        address previous = benefitNFT;
+        benefitNFT = newBenefitNFT;
+        emit BenefitNFTUpdated(previous, newBenefitNFT);
+    }
+
     /// @notice Routes premium income and deposits vault share via `RiskVault.receivePremium`.
     /// @param payer Address that provides token funds.
     /// @param amount Total premium amount to route.
@@ -124,6 +133,36 @@ contract FeeRouter is Ownable2Step, IFeeRouter {
         }
 
         emit ProtocolFeeRouted(msg.sender, payer, amount, treasuryAmount, vaultAmount, treasuryBps);
+    }
+
+    function previewDiscountedProtocolFee(address benefitAccount, uint256 grossAmount)
+        external
+        view
+        returns (uint256 netAmount, uint256 discountBps)
+    {
+        discountBps = _tradingFeeDiscountBps(benefitAccount);
+        netAmount = grossAmount - MathLib.mulBps(grossAmount, discountBps);
+    }
+
+    function routeProtocolFeeWithBenefits(address payer, address benefitAccount, uint256 grossAmount)
+        external
+        onlyAuthorizedCaller
+        returns (uint256 chargedAmount)
+    {
+        if (grossAmount == 0) revert Errors.ZeroAmount();
+
+        uint256 discountBps = _tradingFeeDiscountBps(benefitAccount);
+        chargedAmount = grossAmount - MathLib.mulBps(grossAmount, discountBps);
+
+        (uint256 treasuryAmount, uint256 vaultAmount, uint256 treasuryBps) = _routeFrom(payer, chargedAmount);
+        totalProtocolFeesRouted += chargedAmount;
+
+        if (vaultAmount > 0) {
+            _safeApprove(collateralToken, riskVault, vaultAmount);
+            IRiskVault(riskVault).fundVault(vaultAmount);
+        }
+
+        emit ProtocolFeeRouted(msg.sender, payer, chargedAmount, treasuryAmount, vaultAmount, treasuryBps);
     }
 
     /// @notice Returns current unrouted token balance held by FeeRouter.
@@ -174,5 +213,13 @@ contract FeeRouter is Ownable2Step, IFeeRouter {
         (bool ok1, bytes memory data1) =
             token.call(abi.encodeWithSelector(IERC20Minimal.approve.selector, spender, amount));
         if (!ok1 || (data1.length != 0 && !abi.decode(data1, (bool)))) revert TransferFailed();
+    }
+
+    function _tradingFeeDiscountBps(address benefitAccount) internal view returns (uint256 discountBps) {
+        if (benefitNFT == address(0) || benefitAccount == address(0)) {
+            return 0;
+        }
+
+        discountBps = IZTRXNFTBenefits(benefitNFT).tradingFeeDiscountOf(benefitAccount);
     }
 }

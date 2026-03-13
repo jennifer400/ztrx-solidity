@@ -5,6 +5,7 @@ import {InsuranceController} from "../contracts/core/InsuranceController.sol";
 import {IInsuranceController} from "../contracts/interfaces/IInsuranceController.sol";
 import {RiskConfig} from "../contracts/core/RiskConfig.sol";
 import {RiskVault} from "../contracts/core/RiskVault.sol";
+import {ZTRXNFT} from "../contracts/core/ZTRXNFT.sol";
 import {Types} from "../contracts/libraries/Types.sol";
 import {Errors} from "../contracts/libraries/Errors.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -35,6 +36,7 @@ contract InsuranceControllerTest {
     RiskConfig private config;
     RiskVault private vault;
     InsuranceController private insurance;
+    ZTRXNFT private nft;
 
     address private owner = address(this);
     address private authorizedModule = address(0xAAA1);
@@ -51,8 +53,10 @@ contract InsuranceControllerTest {
         config = new RiskConfig(owner, signer, 5_000, 2_000, 8_000, 120);
         vault = new RiskVault(owner, address(token), address(config));
         insurance = new InsuranceController(owner, address(config), address(vault), address(token));
+        nft = new ZTRXNFT(owner, "ipfs://ztrx/", ".json");
 
         insurance.setAuthorizedCaller(authorizedModule, true);
+        insurance.setBenefitNFT(address(nft));
         vault.setInsuranceController(address(insurance));
         vault.setPremiumCaller(address(insurance), true);
 
@@ -130,6 +134,24 @@ contract InsuranceControllerTest {
         _assertEq(vault.totalAssets(), beforeAssets);
     }
 
+    function testPremiumUsesNftDiscountWhenConfigured() public {
+        _grantOracleBenefits(user, 500, 1_500);
+
+        (IInsuranceController.SignedInsuranceQuote memory q, bytes memory sig) =
+            _signedQuote(user, 9, 2_000e6, 1_000, 2_500);
+        vm.prank(authorizedModule);
+        insurance.registerCoverage(9, q, sig);
+
+        InsuranceController.CoverageSnapshot memory c = insurance.getCoverage(9);
+        _assertEq(c.premiumBps, 500);
+        _assertEq(c.premiumDiscountBps, 500);
+        _assertEq(c.benefitTokenId, 1_950);
+
+        vm.prank(authorizedModule);
+        uint256 premium = insurance.settlePremiumOnProfit(9, user, 1_000e6);
+        _assertEq(premium, 50e6);
+    }
+
     function testClaimPaidOnlyForActiveEligibleLiquidatedPosition() public {
         (IInsuranceController.SignedInsuranceQuote memory q, bytes memory sig) = _signedQuote(user, 8, 2_000e6, 1_000, 2_000);
         vm.prank(authorizedModule);
@@ -148,6 +170,26 @@ contract InsuranceControllerTest {
         vm.prank(authorizedModule);
         vm.expectRevert(Errors.InsuranceNotActive.selector);
         insurance.processLiquidationClaim(8, recipient, 500e6, true);
+    }
+
+    function testClaimCapUsesNftLiquidationBoost() public {
+        _grantOracleBenefits(user, 0, 1_500);
+
+        (IInsuranceController.SignedInsuranceQuote memory q, bytes memory sig) =
+            _signedQuote(user, 10, 2_000e6, 1_000, 2_000);
+        vm.prank(authorizedModule);
+        insurance.registerCoverage(10, q, sig);
+
+        InsuranceController.CoverageSnapshot memory c = insurance.getCoverage(10);
+        _assertEq(c.coverageRatioBps, 3_500);
+        _assertEq(c.liquidationProtectionBoostBps, 1_500);
+        _assertEq(c.reservedAmount, 700e6);
+
+        uint256 before = token.balanceOf(recipient);
+        vm.prank(authorizedModule);
+        uint256 paid = insurance.processLiquidationClaim(10, recipient, 500e6, true);
+        _assertEq(paid, 175e6);
+        _assertEq(token.balanceOf(recipient), before + 175e6);
     }
 
     function _signedQuote(address qUser, uint256 nonce, uint256 sizeUsd, uint256 premiumBps, uint256 coverageBps)
@@ -212,6 +254,22 @@ contract InsuranceControllerTest {
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, digest);
         sig = abi.encodePacked(r, s, v);
+    }
+
+    function _grantOracleBenefits(address account, uint16 insuranceDiscountBps, uint16 liquidationBoostBps) internal {
+        ZTRXNFT.BenefitConfig memory config_ = ZTRXNFT.BenefitConfig({
+            tradingFeeDiscountBps: 0,
+            tokenAirdropBonusBps: 200,
+            insurancePremiumDiscountBps: insuranceDiscountBps,
+            liquidationProtectionBoostBps: liquidationBoostBps,
+            tradingCompetitionBoostBps: 0,
+            lpYieldBoostBps: 0,
+            lpExitCooldownReductionBps: 0,
+            partnerWhitelistEligible: true,
+            priorityAccessEligible: true
+        });
+        nft.setThemeBenefits(ZTRXNFT.Theme.Oracle, config_);
+        nft.adminMint(account, 1_950);
     }
 
     function _assertEq(uint256 a, uint256 b) internal pure {

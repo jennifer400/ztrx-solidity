@@ -10,6 +10,7 @@ import {MathLib} from "../libraries/MathLib.sol";
 import {IInsuranceController} from "../interfaces/IInsuranceController.sol";
 import {IRiskConfig} from "../interfaces/IRiskConfig.sol";
 import {IRiskVault} from "../interfaces/IRiskVault.sol";
+import {IZTRXNFTBenefits} from "../interfaces/IZTRXNFTBenefits.sol";
 
 interface IERC20Minimal {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -20,6 +21,14 @@ interface IERC20Minimal {
 /// @notice Verifies off-chain insurance quotes and enforces insurance lifecycle for positions.
 contract InsuranceController is Ownable2Step, IInsuranceController {
     error TransferFailed();
+
+    struct BenefitAdjustments {
+        uint256 benefitTokenId;
+        uint256 premiumDiscountBps;
+        uint256 liquidationProtectionBoostBps;
+        uint256 appliedPremiumBps;
+        uint256 appliedCoverageRatioBps;
+    }
 
     bytes32 internal constant QUOTE_TYPEHASH = keccak256(
         "InsuranceQuote(address user,bytes32 marketId,bool side,uint256 leverageX18,uint256 sizeUsdX18,uint256 premiumBps,uint256 coverageRatioBps,bytes32 riskControlsHash,uint256 expiry,uint256 nonce,bytes32 modelVersion)"
@@ -47,6 +56,9 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
         uint256 activatedAt;
         uint256 quoteExpiry;
         uint256 quoteNonce;
+        uint256 benefitTokenId;
+        uint256 premiumDiscountBps;
+        uint256 liquidationProtectionBoostBps;
         bytes32 modelVersion;
         bytes32 quoteHash;
         Types.InsuranceStatus status;
@@ -56,6 +68,7 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     address public immutable riskConfig;
     address public immutable riskVault;
     address public immutable collateralToken;
+    address public benefitNFT;
 
     mapping(address caller => bool isAuthorized) public authorizedCaller;
     mapping(uint256 positionId => CoverageSnapshot coverage) private _coverageByPosition;
@@ -63,6 +76,7 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     mapping(address user => uint256 untilTimestamp) public userCooldownUntil;
 
     event AuthorizedCallerUpdated(address indexed caller, bool isAuthorized);
+    event BenefitNFTUpdated(address indexed previousBenefitNFT, address indexed newBenefitNFT);
 
     /// @notice Deploys InsuranceController.
     /// @param initialOwner Governance owner.
@@ -94,6 +108,12 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
         emit AuthorizedCallerUpdated(caller, isAuthorized);
     }
 
+    function setBenefitNFT(address newBenefitNFT) external onlyOwner {
+        address previous = benefitNFT;
+        benefitNFT = newBenefitNFT;
+        emit BenefitNFTUpdated(previous, newBenefitNFT);
+    }
+
     /// @notice Registers coverage on position open and reserves vault capacity.
     /// @param positionId Position identifier.
     /// @param quote Signed insurance quote payload.
@@ -114,16 +134,8 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
         uint256 cap = _coverageCap(quote.userTier);
         if (quote.coverageRatioBps == 0 || quote.coverageRatioBps > cap) revert Errors.InvalidCoverageRatio();
 
-        uint256 maxInsurable = _resolveMaxInsurable(quote);
-        if (maxInsurable == 0 || quote.sizeUsdX18 > maxInsurable) revert Errors.ExceedsMaxInsurableAmount();
-
-        uint256 minHoldingTime = _resolveMinHoldingTime(quote);
-        uint256 activationDelay = _resolveActivationDelay(quote);
-        uint256 fullActivationDelay = _resolveFullActivationDelay(quote);
-        uint256 cooldownSeconds = _resolveCooldownSeconds(quote);
-        if (fullActivationDelay < activationDelay) revert Errors.InvalidLiquidationState();
-
-        uint256 reserveAmount = MathLib.mulBps(quote.sizeUsdX18, quote.coverageRatioBps);
+        BenefitAdjustments memory adjustments = _resolveBenefitAdjustments(quote.user, quote.premiumBps, quote.coverageRatioBps);
+        uint256 reserveAmount = MathLib.mulBps(quote.sizeUsdX18, adjustments.appliedCoverageRatioBps);
         _checkUtilizationThrottle(reserveAmount);
         usedQuotes[quoteHash] = true;
 
@@ -133,19 +145,26 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
         snapshot.side = quote.side;
         snapshot.leverageX18 = quote.leverageX18;
         snapshot.sizeUsdX18 = quote.sizeUsdX18;
-        snapshot.premiumBps = quote.premiumBps;
-        snapshot.coverageRatioBps = quote.coverageRatioBps;
-        snapshot.maxInsurableAmount = maxInsurable;
-        snapshot.minHoldingTime = minHoldingTime;
-        snapshot.cooldownSeconds = cooldownSeconds;
-        snapshot.activationDelay = activationDelay;
-        snapshot.fullActivationDelay = fullActivationDelay;
+        snapshot.premiumBps = adjustments.appliedPremiumBps;
+        snapshot.coverageRatioBps = adjustments.appliedCoverageRatioBps;
+        snapshot.maxInsurableAmount = _resolveMaxInsurable(quote);
+        if (snapshot.maxInsurableAmount == 0 || quote.sizeUsdX18 > snapshot.maxInsurableAmount) {
+            revert Errors.ExceedsMaxInsurableAmount();
+        }
+        snapshot.minHoldingTime = _resolveMinHoldingTime(quote);
+        snapshot.cooldownSeconds = _resolveCooldownSeconds(quote);
+        snapshot.activationDelay = _resolveActivationDelay(quote);
+        snapshot.fullActivationDelay = _resolveFullActivationDelay(quote);
+        if (snapshot.fullActivationDelay < snapshot.activationDelay) revert Errors.InvalidLiquidationState();
         snapshot.userTier = quote.userTier;
         snapshot.marketTier = quote.marketTier;
         snapshot.reservedAmount = reserveAmount;
         snapshot.activatedAt = block.timestamp;
         snapshot.quoteExpiry = quote.expiry;
         snapshot.quoteNonce = quote.nonce;
+        snapshot.benefitTokenId = adjustments.benefitTokenId;
+        snapshot.premiumDiscountBps = adjustments.premiumDiscountBps;
+        snapshot.liquidationProtectionBoostBps = adjustments.liquidationProtectionBoostBps;
         snapshot.modelVersion = quote.modelVersion;
         snapshot.quoteHash = quoteHash;
         snapshot.status = Types.InsuranceStatus.Active;
@@ -403,5 +422,30 @@ contract InsuranceController is Ownable2Step, IInsuranceController {
     function _resolveCooldownSeconds(SignedInsuranceQuote calldata quote) internal view returns (uint256) {
         uint256 v = IRiskConfig(riskConfig).cooldownSecondsByTier(quote.userTier);
         return v == 0 ? quote.cooldownSeconds : v;
+    }
+
+    function _resolveBenefitAdjustments(address user, uint256 premiumBps, uint256 coverageRatioBps)
+        internal
+        view
+        returns (BenefitAdjustments memory adjustments)
+    {
+        if (benefitNFT == address(0)) {
+            adjustments.appliedPremiumBps = premiumBps;
+            adjustments.appliedCoverageRatioBps = coverageRatioBps;
+            return adjustments;
+        }
+
+        adjustments.benefitTokenId = IZTRXNFTBenefits(benefitNFT).activeBenefitToken(user);
+        (uint16 insurancePremiumDiscountBps, uint16 liquidationBoostBps) =
+            IZTRXNFTBenefits(benefitNFT).insuranceBenefitAdjustmentsOf(user);
+
+        adjustments.premiumDiscountBps = insurancePremiumDiscountBps;
+        adjustments.liquidationProtectionBoostBps = liquidationBoostBps;
+        adjustments.appliedPremiumBps =
+            premiumBps > adjustments.premiumDiscountBps ? premiumBps - adjustments.premiumDiscountBps : 0;
+        adjustments.appliedCoverageRatioBps = coverageRatioBps + adjustments.liquidationProtectionBoostBps;
+        if (adjustments.appliedCoverageRatioBps > 10_000) {
+            adjustments.appliedCoverageRatioBps = 10_000;
+        }
     }
 }

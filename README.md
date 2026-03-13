@@ -49,6 +49,15 @@ script/
 
 ## 4) Core Modules
 
+### ZTRXNFT
+
+- ERC-721 collection with fixed supply `2000`
+- Theme buckets:
+  `Sentinel 1200`, `Guardian 500`, `Bastion 220`, `Oracle 80`
+- Supports offline pre-allocation plus user self-claim on-chain
+- Exposes NFT benefit configuration for protocol integrations
+- Supports active-benefit-token selection per wallet when a user holds multiple NFTs
+
 ### MarginVault
 
 - Custodies user collateral (single collateral token in MVP)
@@ -81,6 +90,9 @@ Governance-controlled config source for:
 
 - Insurance reserve pool
 - Tracks `totalAssets`, `totalReserved`, `reservedByPosition`
+- Supports LP deposits with share accounting
+- Supports principal tracking, yield-only claiming, and full redemption
+- Supports NFT-based LP yield boost and LP exit cooldown reduction
 - Reserve/release capacity and pay claims
 
 ### InsuranceController
@@ -89,6 +101,7 @@ Governance-controlled config source for:
 - Prevents quote replay
 - Activates coverage and reserves vault capacity
 - Settles premium on profit (no upfront premium)
+- Applies NFT insurance premium discount and liquidation protection boost
 - Processes liquidation claims with staged activation controls
 
 ### LiquidationEngine
@@ -101,17 +114,20 @@ Governance-controlled config source for:
 
 - Routes premium/protocol fees between treasury and RiskVault
 - Uses configured split from RiskConfig
+- Supports NFT-based trading fee discounts
 - Keeps accounting explicit and queryable
 
 ---
 
 ## 5) Dependency Graph (Concise)
 
+- `ZTRXNFT -> protocol benefit source for InsuranceController, FeeRouter, RiskVault`
 - `PositionManager -> IMarginVault, IRiskConfig, IInsuranceController`
 - `LiquidationEngine -> IPositionManager, IOracleAdapter, IRiskConfig, IInsuranceController`
 - `InsuranceController -> IRiskConfig, IRiskVault`
-- `RiskVault -> IRiskConfig`
-- `FeeRouter -> IRiskConfig, IRiskVault`
+- `InsuranceController -> IZTRXNFTBenefits` (optional)
+- `RiskVault -> IRiskConfig, IZTRXNFTBenefits` (optional)
+- `FeeRouter -> IRiskConfig, IRiskVault, IZTRXNFTBenefits` (optional)
 
 ---
 
@@ -141,6 +157,52 @@ Coverage can scale in over time:
 - between `activationDelay` and `fullActivationDelay`: linearly increasing
 - after `fullActivationDelay`: full quoted coverage
 
+### 6.4 NFT benefits as protocol-side inputs
+
+The NFT contract is not just collectible metadata. It is also a benefit source for protocol modules.
+
+Current integrations:
+
+- `InsuranceController`
+  applies `insurancePremiumDiscountBps` and `liquidationProtectionBoostBps`
+- `FeeRouter`
+  applies `tradingFeeDiscountBps` through the benefit-aware routing path
+- `RiskVault`
+  applies `lpYieldBoostBps` on LP share minting and `lpExitCooldownReductionBps` on LP exit timing
+
+The NFT contract exposes:
+
+- address-level active benefit selection
+- full benefit profile lookup
+- narrower lookup functions for trading, insurance, and liquidity modules
+
+### 6.5 LP vault shares, yield, and claims
+
+`RiskVault` now behaves as an LP-backed insurance pool:
+
+- LPs deposit collateral through `depositLiquidity(...)`
+- vault shares are minted proportionally
+- premium income increases `totalAssets` and therefore LP share value
+- LPs can:
+  redeem normally through `redeemLiquidity(...)`
+  or claim profit only through `claimYield(...)`
+
+Accounting notes:
+
+- `principalBalanceOf(user)` tracks deposited principal
+- `lpAssetValue(user)` returns current share value
+- `claimableYieldOf(user)` returns profit above principal
+- reserved insurance capacity cannot be withdrawn by LPs
+
+### 6.6 LP cooldown with NFT reduction
+
+The vault supports a governance-controlled base LP exit cooldown.
+
+- LP withdrawals and yield claims are blocked until `lpUnlockTime(user)`
+- NFTs can reduce that cooldown through `lpExitCooldownReductionBps`
+- cooldown is refreshed on new LP deposits
+- this lets higher-tier NFTs enjoy faster LP capital mobility without changing claim reserve safety
+
 ---
 
 ## 7) Deployment and Wiring
@@ -148,24 +210,36 @@ Coverage can scale in over time:
 Recommended deployment order:
 
 1. `RiskConfig`
-2. `MarginVault`
-3. `RiskVault`
-4. `OracleAdapter`
-5. `InsuranceController`
-6. `PositionManager`
-7. `LiquidationEngine`
-8. `FeeRouter`
+2. `ZTRXNFT`
+3. `MarginVault`
+4. `RiskVault`
+5. `OracleAdapter`
+6. `InsuranceController`
+7. `PositionManager`
+8. `LiquidationEngine`
+9. `FeeRouter`
 
 Recommended initialization wiring:
 
+- `ZTRXNFT.setThemeBenefits(theme, config)` for each NFT theme
 - `MarginVault.setAuthorizedModule(PositionManager, true)`
 - `PositionManager.setRelayer(relayer, true)`
 - `PositionManager.setInsuranceController(InsuranceController)`
 - `RiskVault.setInsuranceController(InsuranceController)`
 - `RiskVault.setPremiumCaller(InsuranceController, true)`
 - `RiskVault.setPremiumCaller(FeeRouter, true)` (if used)
+- `RiskVault.setBenefitNFT(ZTRXNFT)`
+- `RiskVault.setBaseExitCooldown(seconds)` (if LP cooldown is used)
 - `InsuranceController.setAuthorizedCaller(orchestrator / engine, true)`
+- `InsuranceController.setBenefitNFT(ZTRXNFT)`
 - `FeeRouter.setAuthorizedCaller(protocol module, true)`
+- `FeeRouter.setBenefitNFT(ZTRXNFT)`
+
+Recommended NFT claim preparation:
+
+- owner pre-assigns token ids with `assignRecipients(...)`
+- users connect wallet and call `claim(...)` / `claimBatch(...)`
+- if a wallet holds multiple NFTs, it can choose the active rights source via `setActiveBenefitToken(...)`
 
 ---
 
@@ -223,6 +297,8 @@ Target specific suites:
 ```bash
 forge test --match-contract PositionManagerTest
 forge test --match-contract InsuranceControllerTest
+forge test --match-contract RiskVaultTest
+forge test --match-contract ZTRXNFTTest
 forge test --match-contract ProtocolFuzzTest
 forge test --match-contract ProtocolInvariants
 ```
@@ -243,3 +319,6 @@ forge test --match-contract ProtocolInvariants
 - Relayer/oracle/signing inputs are trusted infrastructure assumptions
 - No on-chain matching engine in this repo
 - `bps` is used for all ratios (`10000 = 100%`)
+- NFT benefits are optional integrations; protocol modules still work with benefit source unset
+- LP yield boost is implemented by minting additional vault shares on deposit
+- LP yield claiming is implemented by burning shares against accrued profit while keeping tracked principal unchanged
