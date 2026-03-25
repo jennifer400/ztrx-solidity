@@ -9,6 +9,7 @@ import {Events} from "../libraries/Events.sol";
 import {IMarginVault} from "../interfaces/IMarginVault.sol";
 import {IRiskConfig} from "../interfaces/IRiskConfig.sol";
 import {IInsuranceController} from "../interfaces/IInsuranceController.sol";
+import {ILiquidationEngine} from "../interfaces/ILiquidationEngine.sol";
 import {IPositionManager} from "../interfaces/IPositionManager.sol";
 
 /// @title PositionManager
@@ -56,12 +57,14 @@ contract PositionManager is Ownable2Step, IPositionManager {
     address public immutable marginVault;
     address public immutable riskConfig;
     address public insuranceController;
+    address public liquidationEngine;
 
     mapping(address relayer => bool isAuthorized) public authorizedRelayer;
     mapping(address user => mapping(bytes32 marketId => Types.Position position)) private _positions;
 
     event RelayerUpdated(address indexed relayer, bool isAuthorized);
     event InsuranceControllerUpdated(address indexed previousController, address indexed newController);
+    event LiquidationEngineUpdated(address indexed previousEngine, address indexed newEngine);
 
     /// @notice Deploys PositionManager with owner and module dependencies.
     /// @param initialOwner Governance owner.
@@ -93,6 +96,14 @@ contract PositionManager is Ownable2Step, IPositionManager {
         address previous = insuranceController;
         insuranceController = newInsuranceController;
         emit InsuranceControllerUpdated(previous, newInsuranceController);
+    }
+
+    /// @notice Sets the liquidation engine used to refresh liquidation protection state after margin top-ups.
+    /// @param newLiquidationEngine Liquidation engine address.
+    function setLiquidationEngine(address newLiquidationEngine) external onlyOwner {
+        address previous = liquidationEngine;
+        liquidationEngine = newLiquidationEngine;
+        emit LiquidationEngineUpdated(previous, newLiquidationEngine);
     }
 
     /// @notice Opens a new isolated position for a user and market.
@@ -150,10 +161,12 @@ contract PositionManager is Ownable2Step, IPositionManager {
     }
 
     /// @notice Increases size and optional margin of an existing open position.
+    /// @dev Reverts while liquidation grace protection is active so users cannot expand risk during the rescue window.
     /// @param params Increase parameters settled by authorized relayer.
     function increasePosition(IncreasePositionParams calldata params) external onlyRelayer {
         Types.Position storage position = _getOpenPosition(params.owner, params.marketId);
         if (params.sizeDeltaUsdX18 == 0 || params.executionPriceX18 == 0) revert Errors.ZeroAmount();
+        _enforceNotInGracePeriod(params.owner, params.marketId);
 
         if (params.additionalMargin > 0) {
             IMarginVault(marginVault).lockMargin(params.owner, params.additionalMargin);
@@ -172,6 +185,25 @@ contract PositionManager is Ownable2Step, IPositionManager {
         _validateLeverage(position.leverageX18, market.maxLeverageX18);
 
         emit Events.PositionIncreased(position.id, position.sizeUsdX18, params.additionalMargin);
+    }
+
+    /// @notice Adds isolated margin to an existing open position without changing position size.
+    /// @param marketId Market identifier.
+    /// @param amount Additional collateral amount to lock.
+    function addMargin(bytes32 marketId, uint256 amount) external override {
+        Types.Position storage position = _getOpenPosition(msg.sender, marketId);
+        if (amount == 0) revert Errors.ZeroAmount();
+
+        IMarginVault(marginVault).lockMargin(msg.sender, amount);
+        position.collateralAmount += amount;
+        position.leverageX18 = _calculateLeverageX18(position.sizeUsdX18, position.collateralAmount);
+
+        emit Events.PositionMarginAdded(position.id, msg.sender, marketId, amount, position.collateralAmount);
+
+        // Best-effort protection refresh so users can top up even if the oracle is temporarily unavailable.
+        if (liquidationEngine != address(0)) {
+            try ILiquidationEngine(liquidationEngine).onMarginUpdated(msg.sender, marketId) {} catch {}
+        }
     }
 
     /// @notice Reduces part of an open position and unlocks proportional margin.
@@ -294,5 +326,12 @@ contract PositionManager is Ownable2Step, IPositionManager {
 
         bool isProfit = isLong ? (exitPriceX18 >= entryPriceX18) : (exitPriceX18 <= entryPriceX18);
         return isProfit ? int256(pnlAbs) : -int256(pnlAbs);
+    }
+
+    function _enforceNotInGracePeriod(address user, bytes32 marketId) internal view {
+        if (liquidationEngine == address(0)) return;
+
+        uint256 graceExpiry = ILiquidationEngine(liquidationEngine).getGracePeriodExpiry(user, marketId);
+        if (graceExpiry != 0 && block.timestamp < graceExpiry) revert Errors.GracePeriodActive();
     }
 }

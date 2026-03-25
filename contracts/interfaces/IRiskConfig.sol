@@ -16,5 +16,6 @@ interface IRiskConfig {
     function vaultUtilizationLimitBps() external view returns (uint256);
     function utilizationThrottleBps() external view returns (uint256);
     function liquidationPenaltyBps() external view returns (uint256);
+    function liquidationGracePeriodSeconds() external view returns (uint256);
     function quoteSigner() external view returns (address);
 }

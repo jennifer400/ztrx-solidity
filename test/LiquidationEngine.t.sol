@@ -54,6 +54,7 @@ contract LiquidationEngineTest {
         positionManager.setRelayer(owner, true);
         positionManager.setRelayer(address(liquidationEngine), true);
         positionManager.setInsuranceController(address(insurance));
+        positionManager.setLiquidationEngine(address(liquidationEngine));
 
         Types.MarketConfig memory cfg = Types.MarketConfig({
             isActive: true,
@@ -100,13 +101,34 @@ contract LiquidationEngineTest {
         liquidationEngine.liquidate(user, marketId);
     }
 
-    function testLiquidationTriggersInsuranceClaimPathWhenActive() public {
+    function testInsuredLiquidationStartsGracePeriodFirst() public {
+        _openPosition(true, bytes32("insured"));
+
+        markFeed.setAnswer(80e8, block.timestamp);
+        indexFeed.setAnswer(80e8, block.timestamp);
+
+        liquidationEngine.liquidate(user, marketId);
+
+        _assertEq(insurance.processCallCount(), 0);
+        _assertEq(liquidationEngine.getGracePeriodExpiry(user, marketId), block.timestamp + 300);
+        Types.Position memory p = positionManager.getPosition(user, marketId);
+        _assertEq(uint256(uint8(p.status)), uint256(uint8(Types.PositionStatus.Open)));
+    }
+
+    function testLiquidationTriggersInsuranceClaimPathWhenActiveAfterGrace() public {
         insurance.setClaimToReturn(50e18);
         _openPosition(true, bytes32("insured"));
 
         markFeed.setAnswer(80e8, block.timestamp);
         indexFeed.setAnswer(80e8, block.timestamp);
 
+        liquidationEngine.liquidate(user, marketId);
+        vm.expectRevert(Errors.GracePeriodActive.selector);
+        liquidationEngine.liquidate(user, marketId);
+
+        vm.warp(block.timestamp + 301);
+        markFeed.setAnswer(80e8, block.timestamp);
+        indexFeed.setAnswer(80e8, block.timestamp);
         liquidationEngine.liquidate(user, marketId);
 
         _assertEq(insurance.processCallCount(), 1);
@@ -122,6 +144,21 @@ contract LiquidationEngineTest {
 
         liquidationEngine.liquidate(user, marketId);
         _assertEq(insurance.processCallCount(), 0);
+    }
+
+    function testMarginTopUpClearsGraceProtectionWhenHealthyAgain() public {
+        _openPosition(true, bytes32("insured"));
+        markFeed.setAnswer(80e8, block.timestamp);
+        indexFeed.setAnswer(80e8, block.timestamp);
+
+        liquidationEngine.liquidate(user, marketId);
+        _assertEq(liquidationEngine.getGracePeriodExpiry(user, marketId), block.timestamp + 300);
+
+        vm.prank(user);
+        positionManager.addMargin(marketId, 200e18);
+
+        _assertEq(liquidationEngine.getGracePeriodExpiry(user, marketId), 0);
+        _assertEq(liquidationEngine.isLiquidatable(user, marketId), false);
     }
 
     function testEdgeCaseStaleOracleRejected() public {

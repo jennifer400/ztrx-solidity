@@ -4,11 +4,14 @@ pragma solidity ^0.8.24;
 import {PositionManager} from "../contracts/core/PositionManager.sol";
 import {MarginVault} from "../contracts/core/MarginVault.sol";
 import {RiskConfig} from "../contracts/core/RiskConfig.sol";
+import {LiquidationEngine} from "../contracts/core/LiquidationEngine.sol";
+import {OracleAdapter} from "../contracts/core/OracleAdapter.sol";
 import {Types} from "../contracts/libraries/Types.sol";
 import {Errors} from "../contracts/libraries/Errors.sol";
 import {Events} from "../contracts/libraries/Events.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockInsuranceModule} from "./mocks/MockInsuranceModule.sol";
+import {MockPriceFeed} from "./mocks/MockPriceFeed.sol";
 
 interface Vm {
     function prank(address) external;
@@ -27,6 +30,10 @@ contract PositionManagerTest {
     RiskConfig private config;
     PositionManager private manager;
     MockInsuranceModule private insurance;
+    MockPriceFeed private markFeed;
+    MockPriceFeed private indexFeed;
+    OracleAdapter private oracle;
+    LiquidationEngine private liquidationEngine;
 
     address private owner = address(this);
     address private quoteSigner = address(0xBEEF);
@@ -42,9 +49,15 @@ contract PositionManagerTest {
         config = new RiskConfig(owner, quoteSigner, 3_000, 2_000, 8_000, 100);
         manager = new PositionManager(owner, address(vault), address(config));
         insurance = new MockInsuranceModule();
+        markFeed = new MockPriceFeed(8);
+        indexFeed = new MockPriceFeed(8);
+        oracle = new OracleAdapter(owner);
+        liquidationEngine = new LiquidationEngine(address(manager), address(oracle), address(config), address(insurance));
 
         vault.setAuthorizedModule(address(manager), true);
         manager.setRelayer(relayer, true);
+        manager.setRelayer(address(liquidationEngine), true);
+        manager.setLiquidationEngine(address(liquidationEngine));
 
         Types.MarketConfig memory m = Types.MarketConfig({
             isActive: true,
@@ -56,6 +69,9 @@ contract PositionManagerTest {
             maxOpenInterestUsdX18: 100_000_000e18
         });
         config.setMarketConfig(marketId, m);
+        markFeed.setAnswer(2_000e8, block.timestamp);
+        indexFeed.setAnswer(2_000e8, block.timestamp);
+        oracle.setMarketFeeds(marketId, address(markFeed), address(indexFeed), 300, 500, 1e18, 10_000_000e18);
 
         token.mint(user, 1_000_000e6);
         vm.prank(user);
@@ -208,6 +224,56 @@ contract PositionManagerTest {
         _assertEq(vault.lockedMargin(user), p.margin);
     }
 
+    function testAddMarginHappyPathAndEvent() public {
+        vm.prank(relayer);
+        manager.openPosition(_defaultOpenParams());
+
+        vm.expectEmit(true, true, true, true);
+        emit Events.PositionMarginAdded(1, user, marketId, 1_000e6, 11_000e6);
+        vm.prank(user);
+        manager.addMargin(marketId, 1_000e6);
+
+        Types.Position memory pos = manager.getPosition(user, marketId);
+        _assertEq(pos.collateralAmount, 11_000e6);
+        _assertEq(vault.lockedMargin(user), 11_000e6);
+    }
+
+    function testAddMarginRequiresOpenPositionAndNonZeroAmount() public {
+        vm.prank(user);
+        vm.expectRevert(Errors.InactivePosition.selector);
+        manager.addMargin(marketId, 1_000e6);
+
+        vm.prank(relayer);
+        manager.openPosition(_defaultOpenParams());
+
+        vm.prank(user);
+        vm.expectRevert(Errors.ZeroAmount.selector);
+        manager.addMargin(marketId, 0);
+    }
+
+    function testAddMarginSucceedsWhileLiquidationEngineIsConfigured() public {
+        manager.setInsuranceController(address(insurance));
+        insurance.setOpenReturnValue(true);
+
+        PositionManager.OpenPositionParams memory p = _defaultOpenParams();
+        p.insuranceTermId = bytes32("insured");
+        vm.prank(relayer);
+        manager.openPosition(p);
+
+        markFeed.setAnswer(1_700e8, block.timestamp);
+        indexFeed.setAnswer(1_700e8, block.timestamp);
+        liquidationEngine.liquidate(user, marketId);
+
+        _assertEq(liquidationEngine.getGracePeriodExpiry(user, marketId), block.timestamp + 300);
+
+        vm.prank(user);
+        manager.addMargin(marketId, 20_000e6);
+
+        Types.Position memory pos = manager.getPosition(user, marketId);
+        _assertEq(pos.collateralAmount, 30_000e6);
+        _assertEq(vault.lockedMargin(user), 30_000e6);
+    }
+
     function testIncreasePositionAuthorizationAndInvalidInput() public {
         vm.prank(relayer);
         manager.openPosition(_defaultOpenParams());
@@ -233,6 +299,31 @@ contract PositionManagerTest {
         inc.executionPriceX18 = 0;
         vm.prank(relayer);
         vm.expectRevert(Errors.ZeroAmount.selector);
+        manager.increasePosition(inc);
+    }
+
+    function testIncreasePositionBlockedDuringLiquidationGracePeriod() public {
+        manager.setInsuranceController(address(insurance));
+        insurance.setOpenReturnValue(true);
+
+        PositionManager.OpenPositionParams memory p = _defaultOpenParams();
+        p.insuranceTermId = bytes32("insured");
+        vm.prank(relayer);
+        manager.openPosition(p);
+
+        markFeed.setAnswer(1_700e8, block.timestamp);
+        indexFeed.setAnswer(1_700e8, block.timestamp);
+        liquidationEngine.liquidate(user, marketId);
+
+        PositionManager.IncreasePositionParams memory inc = PositionManager.IncreasePositionParams({
+            owner: user,
+            marketId: marketId,
+            sizeDeltaUsdX18: 10_000e18,
+            executionPriceX18: 1_700e18,
+            additionalMargin: 0
+        });
+        vm.prank(relayer);
+        vm.expectRevert(Errors.GracePeriodActive.selector);
         manager.increasePosition(inc);
     }
 
@@ -276,6 +367,32 @@ contract PositionManagerTest {
         _assertEq(pos.sizeUsdX18, 60_000e18);
         _assertEq(pos.collateralAmount, 6_000e6);
         _assertEq(vault.lockedMargin(user), 6_000e6);
+    }
+
+    function testReducePositionAllowedDuringLiquidationGracePeriod() public {
+        manager.setInsuranceController(address(insurance));
+        insurance.setOpenReturnValue(true);
+
+        PositionManager.OpenPositionParams memory p = _defaultOpenParams();
+        p.insuranceTermId = bytes32("insured");
+        vm.prank(relayer);
+        manager.openPosition(p);
+
+        markFeed.setAnswer(1_700e8, block.timestamp);
+        indexFeed.setAnswer(1_700e8, block.timestamp);
+        liquidationEngine.liquidate(user, marketId);
+
+        PositionManager.ReducePositionParams memory r = PositionManager.ReducePositionParams({
+            owner: user,
+            marketId: marketId,
+            sizeDeltaUsdX18: 20_000e18,
+            executionPriceX18: 1_700e18
+        });
+        vm.prank(relayer);
+        manager.reducePosition(r);
+
+        Types.Position memory pos = manager.getPosition(user, marketId);
+        _assertEq(pos.sizeUsdX18, 80_000e18);
     }
 
     function testReducePositionInvalidInputAndBoundaryReverts() public {

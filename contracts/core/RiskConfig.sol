@@ -14,6 +14,7 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
 
     uint256 private constant BPS_DIVISOR = 10_000;
     uint256 private constant MAX_COVERAGE_RATIO_BPS = 5_000;
+    uint256 private constant DEFAULT_LIQUIDATION_GRACE_PERIOD = 5 minutes;
 
     mapping(bytes32 marketId => Types.MarketConfig config) private _marketConfigs;
 
@@ -22,6 +23,7 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
     uint256 private _vaultUtilizationLimitBps;
     uint256 private _utilizationThrottleBps;
     uint256 private _liquidationPenaltyBps;
+    uint256 private _liquidationGracePeriodSeconds;
     address private _quoteSigner;
     mapping(uint8 tier => uint256) private _maxCoverageRatioByTier;
     mapping(bytes32 marketId => uint256) private _maxInsurableAmountByMarket;
@@ -35,6 +37,7 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
     event VaultUtilizationLimitBpsUpdated(uint256 previousValue, uint256 newValue);
     event UtilizationThrottleBpsUpdated(uint256 previousValue, uint256 newValue);
     event LiquidationPenaltyBpsUpdated(uint256 previousValue, uint256 newValue);
+    event LiquidationGracePeriodUpdated(uint256 previousValue, uint256 newValue);
     event QuoteSignerUpdated(address indexed previousSigner, address indexed newSigner);
     event CoverageTierUpdated(uint8 indexed tier, uint256 maxCoverageRatioBps);
     event MarketInsuranceLimitsUpdated(
@@ -67,6 +70,7 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         _setVaultUtilizationLimitBps(initialVaultUtilizationLimitBps);
         _setUtilizationThrottleBps(initialVaultUtilizationLimitBps);
         _setLiquidationPenaltyBps(initialLiquidationPenaltyBps);
+        _setLiquidationGracePeriodSeconds(DEFAULT_LIQUIDATION_GRACE_PERIOD);
     }
 
     /// @notice Creates or updates market-level risk configuration.
@@ -123,6 +127,12 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
     /// @param newLiquidationPenaltyBps Penalty ratio in basis points.
     function setLiquidationPenaltyBps(uint256 newLiquidationPenaltyBps) external onlyOwner {
         _setLiquidationPenaltyBps(newLiquidationPenaltyBps);
+    }
+
+    /// @notice Updates the liquidation grace period granted to insured positions before forced liquidation.
+    /// @param newLiquidationGracePeriodSeconds Grace period duration in seconds.
+    function setLiquidationGracePeriodSeconds(uint256 newLiquidationGracePeriodSeconds) external onlyOwner {
+        _setLiquidationGracePeriodSeconds(newLiquidationGracePeriodSeconds);
     }
 
     /// @notice Updates authorized insurance quote signer.
@@ -226,6 +236,11 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         return _liquidationPenaltyBps;
     }
 
+    /// @notice Returns liquidation grace period in seconds for insured positions.
+    function liquidationGracePeriodSeconds() external view override returns (uint256) {
+        return _liquidationGracePeriodSeconds;
+    }
+
     /// @notice Returns the authorized off-chain quote signer.
     function quoteSigner() external view override returns (address) {
         return _quoteSigner;
@@ -288,6 +303,12 @@ contract RiskConfig is Ownable2Step, IRiskConfig {
         uint256 previous = _liquidationPenaltyBps;
         _liquidationPenaltyBps = newValue;
         emit LiquidationPenaltyBpsUpdated(previous, newValue);
+    }
+
+    function _setLiquidationGracePeriodSeconds(uint256 newValue) internal {
+        uint256 previous = _liquidationGracePeriodSeconds;
+        _liquidationGracePeriodSeconds = newValue;
+        emit LiquidationGracePeriodUpdated(previous, newValue);
     }
 
     function _setUtilizationThrottleBps(uint256 newValue) internal {

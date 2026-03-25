@@ -28,6 +28,7 @@ library Events {
         bool isLong
     );
     event PositionIncreased(uint256 indexed positionId, uint256 newSizeUsdX18, uint256 addedCollateral);
+    event PositionMarginAdded(uint256 indexed positionId, address indexed trader, bytes32 indexed marketId, uint256 amount, uint256 newCollateralAmount);
     event PositionReduced(uint256 indexed positionId, uint256 reducedSizeUsdX18, int256 realizedPnl);
     event PositionClosed(uint256 indexed positionId, int256 realizedPnl, uint256 exitPriceX18);
 
@@ -56,6 +57,10 @@ library Events {
     event InsuranceCancelled(uint256 indexed insuranceId, uint256 indexed positionId);
 
     event LiquidationTriggered(uint256 indexed positionId, address indexed liquidator, uint256 markPriceX18);
+    event LiquidationProtectionActivated(
+        uint256 indexed positionId, address indexed trader, bytes32 indexed marketId, uint256 expiresAt
+    );
+    event LiquidationProtectionReleased(uint256 indexed positionId, address indexed trader, bytes32 indexed marketId);
     event LiquidationCompleted(
         uint256 indexed positionId,
         address indexed liquidator,

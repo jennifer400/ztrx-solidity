@@ -18,6 +18,7 @@ contract LiquidationEngine is ILiquidationEngine {
     address public immutable oracleAdapter;
     address public immutable riskConfig;
     address public immutable insuranceController;
+    mapping(bytes32 graceKey => uint256 expiry) private _gracePeriodExpiry;
 
     /// @notice Creates liquidation engine with protocol module dependencies.
     /// @param positionManager_ PositionManager address.
@@ -46,7 +47,18 @@ contract LiquidationEngine is ILiquidationEngine {
         Types.MarketConfig memory cfg = IRiskConfig(riskConfig).getMarketConfig(marketId);
         if (!cfg.isActive) revert Errors.InvalidMarket();
 
-        liquidatable = _isMaintenanceBreached(position, markPriceX18, cfg.maintenanceMarginBps);
+        if (!_isMaintenanceBreached(position, markPriceX18, cfg.maintenanceMarginBps)) return false;
+        if (_isGraceProtected(position, _gracePeriodExpiry[_graceKey(user, marketId)])) return false;
+
+        liquidatable = true;
+    }
+
+    /// @notice Returns the stored grace period expiry for a user and market pair.
+    /// @param user Position owner.
+    /// @param marketId Market identifier.
+    /// @return expiry Timestamp when liquidation protection expires.
+    function getGracePeriodExpiry(address user, bytes32 marketId) external view override returns (uint256 expiry) {
+        return _gracePeriodExpiry[_graceKey(user, marketId)];
     }
 
     /// @notice Executes liquidation for a liquidatable position and settles insurance claim if applicable.
@@ -59,7 +71,22 @@ contract LiquidationEngine is ILiquidationEngine {
         uint256 markPriceX18 = IOracleAdapter(oracleAdapter).getMarkPrice(marketId);
         Types.MarketConfig memory cfg = IRiskConfig(riskConfig).getMarketConfig(marketId);
         if (!cfg.isActive) revert Errors.InvalidMarket();
-        if (!_isMaintenanceBreached(position, markPriceX18, cfg.maintenanceMarginBps)) revert Errors.InvalidLiquidationState();
+        if (!_isMaintenanceBreached(position, markPriceX18, cfg.maintenanceMarginBps)) {
+            _clearGracePeriod(user, marketId, position);
+            revert Errors.InvalidLiquidationState();
+        }
+
+        bytes32 graceKey = _graceKey(user, marketId);
+        uint256 graceExpiry = _gracePeriodExpiry[graceKey];
+        if (_isProtectedPosition(position)) {
+            if (graceExpiry == 0) {
+                graceExpiry = block.timestamp + IRiskConfig(riskConfig).liquidationGracePeriodSeconds();
+                _gracePeriodExpiry[graceKey] = graceExpiry;
+                emit Events.LiquidationProtectionActivated(position.id, user, marketId, graceExpiry);
+                return;
+            }
+            if (block.timestamp < graceExpiry) revert Errors.GracePeriodActive();
+        }
 
         emit Events.LiquidationTriggered(position.id, msg.sender, markPriceX18);
 
@@ -73,7 +100,33 @@ contract LiquidationEngine is ILiquidationEngine {
         }
 
         IPositionManager(positionManager).markLiquidated(user, marketId, msg.sender, markPriceX18);
+        delete _gracePeriodExpiry[graceKey];
         emit Events.LiquidationCompleted(position.id, msg.sender, pnl, insurancePayout);
+    }
+
+    /// @notice Refreshes stored protection state after margin top-ups.
+    /// @dev Clears the grace window once the position is back above maintenance margin.
+    /// @param user Position owner.
+    /// @param marketId Market identifier.
+    function onMarginUpdated(address user, bytes32 marketId) external override {
+        if (msg.sender != positionManager) revert Errors.Unauthorized();
+
+        Types.Position memory position = IPositionManager(positionManager).getPosition(user, marketId);
+        if (position.status != Types.PositionStatus.Open) {
+            delete _gracePeriodExpiry[_graceKey(user, marketId)];
+            return;
+        }
+
+        uint256 graceExpiry = _gracePeriodExpiry[_graceKey(user, marketId)];
+        if (graceExpiry == 0) return;
+
+        Types.MarketConfig memory cfg = IRiskConfig(riskConfig).getMarketConfig(marketId);
+        if (!cfg.isActive) revert Errors.InvalidMarket();
+        uint256 markPriceX18 = IOracleAdapter(oracleAdapter).getMarkPrice(marketId);
+
+        if (!_isMaintenanceBreached(position, markPriceX18, cfg.maintenanceMarginBps)) {
+            _clearGracePeriod(user, marketId, position);
+        }
     }
 
     /// @notice Computes whether maintenance margin requirement is breached for a position.
@@ -107,5 +160,25 @@ contract LiquidationEngine is ILiquidationEngine {
         uint256 pnlAbs = (position.sizeUsdX18 * priceDiff) / position.entryPriceX18;
         bool isProfit = position.isLong ? (markPriceX18 >= position.entryPriceX18) : (markPriceX18 <= position.entryPriceX18);
         return isProfit ? int256(pnlAbs) : -int256(pnlAbs);
+    }
+
+    function _isProtectedPosition(Types.Position memory position) internal view returns (bool) {
+        return position.insuranceStatus == Types.InsuranceStatus.Active
+            && IRiskConfig(riskConfig).liquidationGracePeriodSeconds() != 0;
+    }
+
+    function _isGraceProtected(Types.Position memory position, uint256 graceExpiry) internal view returns (bool) {
+        return _isProtectedPosition(position) && (graceExpiry == 0 || block.timestamp < graceExpiry);
+    }
+
+    function _graceKey(address user, bytes32 marketId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(user, marketId));
+    }
+
+    function _clearGracePeriod(address user, bytes32 marketId, Types.Position memory position) internal {
+        bytes32 graceKey = _graceKey(user, marketId);
+        if (_gracePeriodExpiry[graceKey] == 0) return;
+        delete _gracePeriodExpiry[graceKey];
+        emit Events.LiquidationProtectionReleased(position.id, user, marketId);
     }
 }

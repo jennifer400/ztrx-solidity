@@ -21,6 +21,7 @@ library Errors {
     error StalePrice();
     error InvalidPrice();
     error PriceDeviationTooHigh();
+    error GracePeriodActive();
     error CooldownActive();
     error MinHoldingNotMet();
     error CoverageNotEffective();
